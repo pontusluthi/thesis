@@ -1,13 +1,13 @@
 """A small 1D convolutional VAE for fixational gaze windows.
 
-The encoder maps a (2, T) window of sinusoidally squashed gaze velocity to a
-*sequence* of latents, (latent_channels, T / f), rather than to a single vector:
+The encoder maps a (C, T) window of gaze features (position and/or velocity, see
+`--features`) to a *sequence* of latents, (latent_channels, T / f), rather than to a single vector:
 a four second window at 1000 Hz does not survive a global bottleneck, and a
 latent that keeps its time axis is what the DDPM will diffuse over later.
 
 Train on the prepared memmap:
 
-    python -m src.vae --raw data/GazeBase_v2_0 --prepared data/prepared
+    python -m src.vae --raw data/GazeBase_v2_0 --prepared data/prepared --features pos=robust,vel=sin
 """
 
 from __future__ import annotations
@@ -22,9 +22,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 try:  # works both as `src.vae` and as a plain script
-    from .util.dataset import GazeBaseDataset
+    from .util.dataset import DEFAULT_FEATURES, GazeBaseDataset
 except ImportError:  # pragma: no cover
-    from util.dataset import GazeBaseDataset
+    from util.dataset import DEFAULT_FEATURES, GazeBaseDataset
 
 
 @dataclass
@@ -190,10 +190,12 @@ class VAE(nn.Module):
         }
 
 
-def loaders(raw: str, prepared: str, window: int, batch_size: int, workers: int):
+def loaders(raw: str, prepared: str, window: int, batch_size: int, workers: int,
+            features: str | dict = DEFAULT_FEATURES):
     ds = GazeBaseDataset(raw)
-    kw = dict(normalization="sinusoidal", window=window, stride=window)
-    splits = [ds.windows(prepared, s, **kw) for s in ("train", "test")]
+    splits = [ds.windows(prepared, s, features=features, window=window) for s in ("train", "test")]
+    if splits[0].needs_stats:
+        splits[0].stats = splits[1].stats = splits[0].fit_stats()
     return [
         DataLoader(d, batch_size=batch_size, shuffle=train, num_workers=workers,
                    pin_memory=True, drop_last=train)
@@ -214,15 +216,16 @@ def evaluate(model: VAE, loader: DataLoader, device: str) -> dict[str, float]:
 
 
 def train(args: argparse.Namespace) -> None:
-    cfg = VAEConfig(kl_weight=args.kl_weight, latent_channels=args.latent_channels,
-                    stft_weight=args.stft_weight)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    train_loader, val_loader = loaders(
+        args.raw, args.prepared, args.window, args.batch_size, args.workers, args.features
+    )
+    ds = train_loader.dataset
+    cfg = VAEConfig(in_channels=ds.in_channels, kl_weight=args.kl_weight,
+                    latent_channels=args.latent_channels, stft_weight=args.stft_weight)
     if args.window % cfg.downsample:
         raise ValueError(f"window must be a multiple of {cfg.downsample}")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    train_loader, val_loader = loaders(
-        args.raw, args.prepared, args.window, args.batch_size, args.workers
-    )
     model = VAE(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     print(f"{model.cfg}\nlatent {cfg.latent_channels}x{args.window // cfg.downsample} "
@@ -242,8 +245,8 @@ def train(args: argparse.Namespace) -> None:
 
         val = evaluate(model, val_loader, device)
         print(f"epoch {epoch} val  " + "  ".join(f"{k} {t:.4f}" for k, t in val.items()))
-        torch.save({"cfg": asdict(cfg), "window": args.window,
-                    "state_dict": model.state_dict()}, args.out)
+        torch.save({"cfg": asdict(cfg), "window": args.window, "features": ds.features,
+                    "stats": ds.stats, "state_dict": model.state_dict()}, args.out)
 
 
 def main() -> None:
@@ -252,6 +255,8 @@ def main() -> None:
     p.add_argument("--prepared", default="data/prepared")
     p.add_argument("--out", default="checkpoints/vae.pt")
     p.add_argument("--window", type=int, default=4992) # has to be divisible by 16 to fit latent space
+    p.add_argument("--features", default=DEFAULT_FEATURES,
+                   help='e.g. "pos=robust", "vel=sin", "pos=robust,vel=sin"; see dataset.NORMS')
     p.add_argument("--latent-channels", type=int, default=8)
     p.add_argument("--kl-weight", type=float, default=1e-3)
     p.add_argument("--stft-weight", type=float, default=0.0)

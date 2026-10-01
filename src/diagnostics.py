@@ -6,11 +6,17 @@ the noise floor the microsaccade detector thresholds against, which silently cha
 how many events it finds. So `property_stats` and `latent_stats` carry as much weight
 as `reconstruction_metrics`.
 
+The model works in model space (whatever `--features` selected). Everything physical
+(velocity, PSDs, microsaccades) is computed after `to_deg`, the single path that real,
+reconstructed and generated windows all go through.
+
     from src.diagnostics import collect, report
-    report(*collect(model, val_loader, dev))
+    report(*collect(model, val_loader, dev), denorm=val_ds.denorm)
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -18,21 +24,33 @@ from scipy.signal import welch
 
 try:  # works both as `src.diagnostics` and as a plain script
     from .util.microsaccade import microsaccade_extraction
+    from .util.prepare import smooth
 except ImportError:  # pragma: no cover
     from util.microsaccade import microsaccade_extraction
+    from util.prepare import smooth
 
 RATE = 1000
-V_CLIP = 200.0  # the clip used by GazeBaseWindows.preprocess_sin
+# Applied identically to every side before velocity is taken. Set to None to see
+# raw model output -- the shared filter otherwise hides high-frequency junk.
+SMOOTH: dict | None = dict(window_length=23, window="bartlett")
 
 
-def deg(v_sin: np.ndarray) -> np.ndarray:
-    """Undo the sinusoidal squash: back to deg/s."""
-    return (2 * V_CLIP / np.pi) * np.arcsin(np.clip(v_sin, -1, 1))
+def to_deg(x: np.ndarray, denorm: Callable, smooth_cfg: dict | None = SMOOTH):
+    """Model-space (N, C, T) -> (position in deg, velocity in deg/s).
+
+    `denorm` is the dataset's `denorm`, so this works for any feature set. Position
+    is used when the model has it (velocity is then re-derived from it); otherwise it
+    is integrated from velocity, with an arbitrary offset nothing downstream uses.
+    """
+    f = denorm(x)
+    pos = f["pos"] if "pos" in f else np.cumsum(f["vel"], axis=-1) / RATE
+    if smooth_cfg:
+        pos = smooth(pos, axis=-1, **smooth_cfg)
+    return pos, np.gradient(pos, 1 / RATE, axis=-1)
 
 
-def noise_floor(arr: np.ndarray) -> float:
-    """Median-based SD of velocity, i.e. what `microsacc` sets its threshold from."""
-    v = deg(arr)
+def noise_floor(v: np.ndarray) -> float:
+    """Median-based SD of velocity (deg/s), i.e. what `microsacc` sets its threshold from."""
     return float(np.median(np.sqrt(np.median((v - np.median(v, -1, keepdims=True)) ** 2, -1))))
 
 
@@ -56,18 +74,25 @@ def collect(model, loader, device: str, n_batches: int | None = None):
     return tuple(np.concatenate(a) for a in (xs, xh, mus, sds))
 
 
-def reconstruction_metrics(x: np.ndarray, xh: np.ndarray, f_split: float = 60.0) -> dict:
-    """Error, and the two ways this decoder is known to fail: lost highs, lower floor."""
-    err = xh - x
-    f, p_x = welch(deg(x[:, 0]), fs=RATE, nperseg=1024, axis=-1)
-    _, p_h = welch(deg(xh[:, 0]), fs=RATE, nperseg=1024, axis=-1)
+def reconstruction_metrics(x: np.ndarray, xh: np.ndarray, v: np.ndarray, vh: np.ndarray,
+                           f_split: float = 60.0) -> dict:
+    """Error, and the two ways this decoder is known to fail: lost highs, lower floor.
+
+    x, xh: model-space position (what the loss sees). v, vh: velocity in deg/s.
+    Correlation and variance explained are on velocity: on position they sit near 1
+    for any decoder that gets the window offset right, and tell you nothing.
+    """
+    err, verr = xh - x, vh - v
+    f, p_x = welch(v[:, 0], fs=RATE, nperseg=1024, axis=-1)
+    _, p_h = welch(vh[:, 0], fs=RATE, nperseg=1024, axis=-1)
     hi = f >= f_split
     return {
         "mse": float((err ** 2).mean()),
         "mae": float(np.abs(err).mean()),
-        "var_explained": float(1 - err.var() / x.var()),
-        "corr_vx": float(np.corrcoef(x[:, 0].ravel(), xh[:, 0].ravel())[0, 1]),
-        "corr_vy": float(np.corrcoef(x[:, 1].ravel(), xh[:, 1].ravel())[0, 1]),
+        "vel_rmse": float(np.sqrt((verr ** 2).mean())),  # deg/s
+        "var_explained": float(1 - verr.var() / v.var()),
+        "corr_vx": float(np.corrcoef(v[:, 0].ravel(), vh[:, 0].ravel())[0, 1]),
+        "corr_vy": float(np.corrcoef(v[:, 1].ravel(), vh[:, 1].ravel())[0, 1]),
         # Fraction of >60 Hz power the reconstruction keeps; 1.0 is perfect.
         #
         # USE THIS ONLY AS A SEED-AVERAGED NUMBER. Three repeats of one identical
@@ -75,34 +100,35 @@ def reconstruction_metrics(x: np.ndarray, xh: np.ndarray, f_split: float = 60.0)
         # alone, so it cannot rank single runs. That is a real property of the model,
         # not of the metric: a log/geometric version is worse still, because it is
         # then dominated by bins where the reconstruction has almost no power.
+        # (Those numbers were measured on the old sin-velocity pipeline.)
         "hf_retained": float(p_h.mean(0)[hi].mean() / p_x.mean(0)[hi].mean()),
-        "noise_floor_ratio": noise_floor(xh) / noise_floor(x),
+        "noise_floor_ratio": noise_floor(vh) / noise_floor(v),
     }
 
 
-def microsaccades(v_sin: np.ndarray, vfac: float = 5, mindur: int = 6) -> np.ndarray:
-    """Detect in one (2, T) sin-velocity window. Columns: 3 = peak velocity, 6 = amplitude."""
-    v = deg(v_sin).T                     # (T, 2) deg/s
-    pos = np.cumsum(v, axis=0) / RATE    # integrate, so both sides are treated identically
-    return np.asarray(microsaccade_extraction(v, pos, RATE, VFAC=vfac, MINDUR=mindur))
+def microsaccades(v: np.ndarray, pos: np.ndarray, vfac: float = 5, mindur: int = 6) -> np.ndarray:
+    """Detect in one window. v: (2, T) deg/s, pos: (2, T) deg. Columns: 3 = peak velocity, 6 = amplitude."""
+    return np.asarray(microsaccade_extraction(v.T, pos.T, RATE, VFAC=vfac, MINDUR=mindur))
 
 
-def property_stats(arr: np.ndarray, n_windows: int = 300) -> dict:
+def property_stats(pos: np.ndarray, v: np.ndarray, n_windows: int = 300) -> dict:
     """Microsaccade statistics -- the properties the latent actually has to preserve."""
-    arr = arr[:n_windows]
-    sacs = [s for s in (microsaccades(w) for w in arr) if len(s)]
+    pos, v = pos[:n_windows], v[:n_windows]
+    floor = noise_floor(v)
+    sacs = [s for s in map(microsaccades, v, pos) if len(s)]
     if not sacs:
-        return {"rate": 0.0, "amp": np.nan, "peak_vel": np.nan, "main_seq_slope": np.nan}
+        return {"rate": 0.0, "amp": np.nan, "peak_vel": np.nan, "main_seq_slope": np.nan,
+                "noise_floor": floor}
     s = np.concatenate(sacs)
     amp, vpk = s[:, 6], s[:, 3]
     ok = (amp > 0) & (vpk > 0)
     return {
-        "rate": len(s) / (len(arr) * arr.shape[-1] / RATE),
+        "rate": len(s) / (len(v) * v.shape[-1] / RATE),
         "amp": float(np.median(amp)),
         "peak_vel": float(np.median(vpk)),
         # the main sequence is a power law; its exponent is the shape-preserving check
         "main_seq_slope": float(np.polyfit(np.log(amp[ok]), np.log(vpk[ok]), 1)[0]),
-        "noise_floor": noise_floor(arr),
+        "noise_floor": floor,
     }
 
 
@@ -146,15 +172,19 @@ def latent_stats(mu: np.ndarray, sd: np.ndarray, active_thresh: float = 0.01,
     }
 
 
-def report(x: np.ndarray, xh: np.ndarray, mu: np.ndarray, sd: np.ndarray) -> dict:
+def report(x: np.ndarray, xh: np.ndarray, mu: np.ndarray, sd: np.ndarray,
+           denorm: Callable) -> dict:
     """Print every diagnostic and return them flat, so a sweep can tabulate the same call."""
-    rec = reconstruction_metrics(x, xh)
-    real, fake = property_stats(x), property_stats(xh)
+    pos, v = to_deg(x, denorm)
+    pos_h, vh = to_deg(xh, denorm)
+
+    rec = reconstruction_metrics(x, xh, v, vh)
+    real, fake = property_stats(pos, v), property_stats(pos_h, vh)
     lat = latent_stats(mu, sd)
 
     print(f"reconstruction ({len(x)} windows)")
-    for k, v in rec.items():
-        print(f"  {k:20s} {v:9.4f}")
+    for k, val in rec.items():
+        print(f"  {k:20s} {val:9.4f}")
     print("properties               real   reconstruction")
     for k in ("rate", "amp", "peak_vel", "main_seq_slope", "noise_floor"):
         print(f"  {k:20s} {real[k]:8.3f} {fake[k]:12.3f}")
@@ -167,6 +197,6 @@ def report(x: np.ndarray, xh: np.ndarray, mu: np.ndarray, sd: np.ndarray) -> dic
         print(f"  {c:2d} {lat['kl_per_dim'][c]:8.3f} {lat['snr'][c]:7.2f} "
               f"{lat['lag1'][c]:7.2f} {lat['hi_lo'][c]:7.2f}")
 
-    return {**rec, **{f"real_{k}": v for k, v in real.items()},
-            **{f"recon_{k}": v for k, v in fake.items()},
-            **{k: v for k, v in lat.items() if np.isscalar(v) or isinstance(v, (int, float))}}
+    return {**rec, **{f"real_{k}": val for k, val in real.items()},
+            **{f"recon_{k}": val for k, val in fake.items()},
+            **{k: val for k, val in lat.items() if np.isscalar(val) or isinstance(val, (int, float))}}

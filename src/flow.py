@@ -1,6 +1,6 @@
 """Rectified-flow (flow matching) model for fixational gaze windows, DiffWave backbone.
 
-Works directly on the (2, T) sinusoidally squashed velocity -- no latent -- as an
+Works directly on the (C, T) window features (see `--features`) -- no latent -- as an
 alternative to the VAE + latent DDPM route. Linear path between noise x0 ~ N(0, I)
 and data x1, x_t = (1 - t) x0 + t x1; the network predicts the velocity x1 - x0 and
 samples are drawn by integrating that ODE from t = 0 to t = 1.
@@ -28,8 +28,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 try:  # works both as `src.flow` and as a plain script
+    from .util.dataset import DEFAULT_FEATURES
     from .vae import loaders
 except ImportError:  # pragma: no cover
+    from util.dataset import DEFAULT_FEATURES
     from vae import loaders
 
 
@@ -54,7 +56,7 @@ def time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
 
     Scaled by 1000 first: the standard frequencies run from 1 down to 1e-4, which
     suits integer diffusion steps. Fed t in [0, 1] directly, sin(t * f) barely moves
-    for all but the first few dimensions and the network can hardly tell t apart.
+    for all but the first few dimensions. 
     """
     half = dim // 2
     freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device) / (half - 1))
@@ -65,9 +67,7 @@ def time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
 class DilatedConv1d(nn.Conv1d):
     """Kernel-3 dilated conv computed as three shifted copies and one 1x1 conv.
 
-    Same weights and output as nn.Conv1d(padding=d, dilation=d). On ROCm/MIOpen the
-    native dilated kernel is ~15x slower at large dilations (72 vs 5 ms fwd+bwd at
-    d=256 on 16x64x5000), which made the full model ~2 s/step.
+    Because conv1 with dilation argument runs like ass on rocm for some reason. 
     """
 
     def __init__(self, cin: int, cout: int, dilation: int):
@@ -136,7 +136,7 @@ class DiffWave(nn.Module):
         return x / self._std(x)
 
     def from_model(self, x: torch.Tensor) -> torch.Tensor:
-        return (x * self._std(x)).clamp(-1.0, 1.0)  # back to the sine range
+        return x * self._std(x)  # dataset.denorm clips to each normalization's range
 
     def loss(self, x: torch.Tensor, t: torch.Tensor | None = None,
              generator: torch.Generator | None = None) -> torch.Tensor:
@@ -158,7 +158,7 @@ def sample_t(n: int, device, sigma: float = 1.0, p_uniform: float = 0.1) -> torc
 @torch.no_grad()
 def sample(model: DiffWave, n: int, length: int, steps: int = 50, method: str = "heun",
            batch_size: int = 32, seed: int | None = None) -> np.ndarray:
-    """Integrate the ODE from noise to data. Returns (n, C, length) in sine units.
+    """Integrate the ODE from noise to data. Returns (n, C, length) in model space.
 
     Uniform grid. Heun costs two evaluations per step, so `steps` Heun steps are 2x
     the cost of `steps` Euler steps.
@@ -213,9 +213,9 @@ def ema_update(ema: nn.Module, model: nn.Module, decay: float, step: int) -> Non
         pe.lerp_(pm, 1.0 - decay)
 
 
-def save(path: str, model: DiffWave, ema: DiffWave, window: int, epoch: int) -> None:
+def save(path: str, model: DiffWave, ema: DiffWave, window: int, epoch: int, **meta) -> None:
     torch.save({"cfg": asdict(model.cfg), "window": window, "epoch": epoch,
-                "state_dict": model.state_dict(), "ema": ema.state_dict()}, path)
+                "state_dict": model.state_dict(), "ema": ema.state_dict(), **meta}, path)
 
 
 def load(path: str, device: str, use_ema: bool = True) -> tuple[DiffWave, int]:
@@ -230,8 +230,9 @@ def load(path: str, device: str, use_ema: bool = True) -> tuple[DiffWave, int]:
 def train(args: argparse.Namespace) -> DiffWave:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     train_loader, val_loader = loaders(args.raw, args.prepared, args.window,
-                                       args.batch_size, args.workers)
-    cfg = FlowConfig(res_channels=args.res_channels, n_layers=args.n_layers,
+                                       args.batch_size, args.workers, args.features)
+    ds = train_loader.dataset
+    cfg = FlowConfig(in_channels=ds.in_channels, res_channels=args.res_channels, n_layers=args.n_layers,
                      data_std=fit_data_std(train_loader))
     model = DiffWave(cfg).to(device)
     ema = copy.deepcopy(model).requires_grad_(False)
@@ -261,7 +262,7 @@ def train(args: argparse.Namespace) -> DiffWave:
         with amp:
             print(f"epoch {epoch} val  loss {evaluate(model, val_loader, device):.4f}  "
                   f"ema {evaluate(ema, val_loader, device):.4f}")
-        save(args.out, model, ema, args.window, epoch)
+        save(args.out, model, ema, args.window, epoch, features=ds.features, stats=ds.stats)
     return ema
 
 
@@ -271,6 +272,8 @@ def main() -> None:
     p.add_argument("--prepared", default="data/prepared")
     p.add_argument("--out", default="checkpoints/flow.pt")
     p.add_argument("--window", type=int, default=5000)
+    p.add_argument("--features", default=DEFAULT_FEATURES,
+                   help='e.g. "pos=robust", "vel=sin", "pos=robust,vel=sin"; see dataset.NORMS')
     p.add_argument("--res-channels", type=int, default=64)
     p.add_argument("--n-layers", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=16)

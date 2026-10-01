@@ -31,10 +31,7 @@ import pyarrow.csv as pa_csv
 from scipy.ndimage import maximum_filter1d
 from tqdm import tqdm
 
-try:  # works both as `src.util.prepare` and as a plain script
-    from .preprocessing import _convolve_smooth
-except ImportError:  # pragma: no cover
-    from preprocessing import _convolve_smooth
+from scipy.ndimage import convolve1d, maximum_filter1d
 
 RATE = 1000  # GazeBase is recorded at 1000 Hz throughout
 
@@ -52,12 +49,36 @@ class PrepConfig:
     blink_y_thresh: float | None = -15.0  # y below this (deg) is a blink; None to skip
     blink_margin_ms: int = 100  # also interpolate over this much either side
     smooth_window: int = 23  # odd; None smooth_type to skip smoothing
-    smooth_type: str | None = "bartlett"
+    smooth_type: str | None = None
 
 
 def _samples(ms: int) -> int:
     return int(round(RATE * ms / 1000))
 
+_WINDOWS = {
+    "bartlett": np.bartlett, "hanning": np.hanning, "hamming": np.hamming,
+    "blackman": np.blackman, "flat": np.ones,
+}
+
+def smooth(x: np.ndarray, window_length: int, window: str = "bartlett", axis: int = 0) -> np.ndarray:
+    """Zero-phase FIR smoothing along `axis`.
+
+    Use this exact function for real AND generated gaze (e.g. axis=-1 on a
+    (B, 2, T) batch), so both go through an identical filter.
+    """
+    if window_length % 2 == 0:
+        raise ValueError("window_length must be odd (keeps the filter zero-phase)")
+    w = _WINDOWS[window](window_length)
+    return convolve1d(x, w / w.sum(), axis=axis, mode="nearest")
+
+def _smooth(arr: np.ndarray, cfg: PrepConfig) -> np.ndarray:
+    """Smooth gaze channels only; targets are step functions and stay untouched."""
+    if cfg.smooth_type is None:
+        return arr
+    gaze = [i for i, c in enumerate(cfg.channels) if c in ("x", "y")]
+    out = arr.copy()
+    out[:, gaze] = smooth(arr[:, gaze], cfg.smooth_window, cfg.smooth_type, axis=0)
+    return out
 
 def parse_name(path: str) -> dict[str, str]:
     """`S_9180_S2_HSS.csv` -> round 9, subject 180, session 2, task HSS."""
@@ -69,7 +90,6 @@ def parse_name(path: str) -> dict[str, str]:
         "session": session.lstrip("S"),
         "task": task,
     }
-
 
 def read_channels(path: str, channels: tuple[str, ...]) -> np.ndarray:
     """Read the requested columns *by name* into a (T, C) float32 array.
@@ -125,15 +145,7 @@ def _interpolate(arr: np.ndarray, bad: np.ndarray, gaze: list[int]) -> bool:
     return True
 
 
-def _smooth(arr: np.ndarray, cfg: PrepConfig) -> np.ndarray:
-    if cfg.smooth_type is None:
-        return arr
-    out = np.empty_like(arr)
-    for c in range(arr.shape[1]):
-        out[:, c] = _convolve_smooth(
-            arr[:, c], window_length=cfg.smooth_window, window=cfg.smooth_type
-        )
-    return out
+
 
 
 def process_file(path: str, cfg: PrepConfig) -> np.ndarray | None:
